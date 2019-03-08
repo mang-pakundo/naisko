@@ -5,14 +5,15 @@ import urllib2
 import urlparse
 import pickle
 import os
+import time
 import traceback
 import xbmc
 import xbmcgui
 import xbmcplugin
 import xbmcaddon
 
+from functools import wraps
 from random import randint
-from pprint import pprint
 
 user_agent = 'okhttp/3.11.0'
 base_url = 'https://bff-prod.iwant.ph/api/OneCms/cmsapi/OTT'
@@ -27,6 +28,38 @@ mode_show = 3
 mode_episode = 4
 mode_play = 5
 mode_play_live = 6
+recent_id = '42c22ec3-8501-46ca-8ab9-0450f1a37a1d'
+mode_recent = 7
+
+# cache key is the file {key}.dat
+# cache entries are tuples in the form of (ttl, value)
+def get_cache(key):
+    file_path = os.path.join(xbmc.translatePath(this_addon.getAddonInfo('profile')), '%s.dat' % key)
+    c_val = None
+    with open(file_path, 'rb') as f:
+        c_val = pickle.load(f)
+    if c_val and c_val[0] - time.time() > 0:
+        return c_val[1]
+
+def set_cache(key, val, ttl):
+    file_path = os.path.join(xbmc.translatePath(this_addon.getAddonInfo('profile')), '%s.dat' % key)
+    with open(file_path, 'wb') as f:
+        pickle.dump((time.time() + ttl, val), f)
+
+def cached(key, ttl = 10000):
+    def cached_decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            result = get_cache(key)
+            if result:
+                return result
+            else:
+                result = f(*args, **kwargs)
+                if result:
+                    set_cache(key, result, ttl)
+                return result
+        return wrapper
+    return cached_decorator
 
 def build_url(path, base_url = base_url, params = {}):
     url = '{base_url}{path}'.format(base_url = base_url, path = path)
@@ -82,26 +115,39 @@ def add_dir(name, id, mode, is_folder = True, **kwargs):
     return xbmcplugin.addDirectoryItem(handle = this_plugin, url = url, listitem = liz, isFolder = is_folder)
 
 def initialize():
-    init_url = build_url('/getInit')
-    init_data = get_json_response(init_url)
-    with open(init_file, 'wb') as f:
-        pickle.dump(init_data, f)
-    header_url = build_url('/getHeader')
-    header_data = get_json_response(header_url)
-    with open(header_file, 'wb') as f:
-        pickle.dump(header_data, f)
-    get_access_token(False)
+    set_cache('init', {}, -1)
+    set_cache('headers', [], -1)
+    set_cache('sso', {}, -1)
 
+@cached('init')
 def get_init():
-    with open(init_file, 'rb') as f:
-        return pickle.load(f)
+    init_url = build_url('/getInit')
+    return get_json_response(init_url)
 
+@cached('headers')
 def get_headers():
-    with open(header_file, 'rb') as f:
-        return pickle.load(f)
+    header_url = build_url('/getHeader')
+    return get_json_response(header_url)
+
+def get_recents():
+    headers = get_headers()
+    sub_recents = [s for h in headers if 'subMenu' in h 
+        for m in h['subMenu'] if 'subRecent' in m 
+        for s in m['subRecent']]
+    sub_genres = [s for h in headers if 'subMenu' in h
+        for m in h['subMenu'] if 'subGenre' in m
+        for g in m['subGenre'] if 'genreRecent' in g
+        for s in g['genreRecent']]
+    sub_recents.extend(sub_genres)
+
+    for r in sub_recents:
+        add_dir(r['recentTitle'], r['recentId'], mode_play_live if r['recentContentType'] == 'live' else mode_play)
+    xbmcplugin.endOfDirectory(this_plugin)
+    
 
 def get_pages():
     headers = get_headers()
+    add_dir('Latest', recent_id, mode_recent)
     for h in headers:
         add_dir(h['name'], h['id'], mode_genre)
     xbmcplugin.endOfDirectory(this_plugin)
@@ -158,6 +204,7 @@ def play_episode():
     else:
         return xbmcplugin.setResolvedUrl(this_plugin, True, liz)
 
+@cached('sso')
 def do_sso_login():
     try:
         params = {
@@ -173,21 +220,13 @@ def do_sso_login():
             dialog = xbmcgui.Dialog()
             dialog.ok('Login Failed', access_data['message'])
             return None
-        with open(sso_file, 'wb') as f:
-            pickle.dump(access_data, f)
         return access_data
     except:
         xbmc.log(traceback.format_exc())
 
-def get_access_token(allow_cached = True):
-    access_data = None
-    if allow_cached:
-        with open(sso_file, 'rb') as f:
-            access_data = pickle.load(f)
-    if not access_data:
-        access_data = do_sso_login()
-    access_token = access_data['data']['accessToken']['id']
-    return access_token
+def get_access_token():
+    access_data = do_sso_login()
+    return access_data['data']['accessToken']['id']
 
 def try_get_param(params, name, default_value = None):
     return params[name][0] if name in params else default_value
@@ -218,6 +257,7 @@ def auto_generate_ip():
     ip_address = '%s.%s.%s.%s' % (w, x, y, z)
     xbmcaddon.Addon().setSetting('xForwardedForIp', ip_address)
 
+
 mode = mode_page
 params = urlparse.parse_qs(sys.argv[2].replace('?',''))
 name = try_get_param(params, 'name')
@@ -229,6 +269,8 @@ id = try_get_param(params, 'id')
 if mode == mode_page or not id or len(id) == 0:
     initialize()
     get_pages()
+elif mode == mode_recent:
+    get_recents()
 elif mode == mode_genre:
     get_genres()
 elif mode == mode_show:
